@@ -1,0 +1,129 @@
+From a63d9bf15e0e94a8c2ce6ebb37c04d616962197a Mon Sep 17 00:00:00 2001
+From: Kevin Kelani <kkelani@pivotal.io>
+Date: Thu, 6 Apr 2017 14:02:57 -0700
+Subject: [PATCH 1/2] fixes issue where IAM policies get deleted due to race
+ condition
+
+[#136756369]
+
+Signed-off-by: Kalai Wei <kawei@pivotal.io>
+---
+ .../providers/google/resource_google_project_iam_policy.go    | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/builtin/providers/google/resource_google_project_iam_policy.go b/builtin/providers/google/resource_google_project_iam_policy.go
+index 4b2ec79b7..8ceb06c13 100644
+--- a/builtin/providers/google/resource_google_project_iam_policy.go
++++ b/builtin/providers/google/resource_google_project_iam_policy.go
+@@ -80,11 +80,13 @@ func resourceGoogleProjectIamPolicyCreate(d *schema.ResourceData, meta interface
+ 		// assumes that Terraform owns any common policy that exists in
+ 		// the template and project at create time.
+ 		rp := subtractIamPolicy(ep, p)
+-		rps, err := json.Marshal(rp)
++
++		// TODO not unit tested but this fixes the IAM policy issue
++		ps, err := json.Marshal(p)
+ 		if err != nil {
+ 			return fmt.Errorf("Error marshaling restorable IAM policy: %v", err)
+ 		}
+-		d.Set("restore_policy", string(rps))
++		d.Set("restore_policy", string(ps))
+ 
+ 		// Merge the policies together
+ 		mb := mergeBindings(append(p.Bindings, rp.Bindings...))
+@@ -222,8 +224,11 @@ func resourceGoogleProjectIamPolicyDelete(d *schema.ResourceData, meta interface
+ 		if err != nil {
+ 			return fmt.Errorf("Error retrieving previous version of changed project IAM policy: %v", err)
+ 		}
+-		ep.Bindings = rp.Bindings
++
++		// TODO not unit tested but this fixes the IAM policy issue
++		ep = subtractIamPolicy(ep, rp)
+ 	}
++
+ 	if err = setProjectIamPolicy(ep, config, pid); err != nil {
+ 		return fmt.Errorf("Error applying IAM policy to project: %v", err)
+ 	}
+-- 
+2.11.0
+
+
+From e45521a83362f1ea27ec50fdc23ececad9c3b5b8 Mon Sep 17 00:00:00 2001
+From: Kevin Kelani <kkelani@pivotal.io>
+Date: Thu, 13 Apr 2017 14:56:47 -0700
+Subject: [PATCH 2/2] does not remove iam policies on second apply
+
+- "policy_data" contains only the policy that the template is attempting
+  to create/change
+- "restore_policy" no longer to store snapshot
+
+[#143623309]
+
+Signed-off-by: Kalai Wei <kawei@pivotal.io>
+---
+ .../google/resource_google_project_iam_policy.go   | 28 ++++------------------
+ 1 file changed, 4 insertions(+), 24 deletions(-)
+
+diff --git a/builtin/providers/google/resource_google_project_iam_policy.go b/builtin/providers/google/resource_google_project_iam_policy.go
+index 8ceb06c13..0e95afa43 100644
+--- a/builtin/providers/google/resource_google_project_iam_policy.go
++++ b/builtin/providers/google/resource_google_project_iam_policy.go
+@@ -86,7 +86,7 @@ func resourceGoogleProjectIamPolicyCreate(d *schema.ResourceData, meta interface
+ 		if err != nil {
+ 			return fmt.Errorf("Error marshaling restorable IAM policy: %v", err)
+ 		}
+-		d.Set("restore_policy", string(ps))
++		d.Set("policy_data", string(ps))
+ 
+ 		// Merge the policies together
+ 		mb := mergeBindings(append(p.Bindings, rp.Bindings...))
+@@ -109,27 +109,8 @@ func resourceGoogleProjectIamPolicyRead(d *schema.ResourceData, meta interface{}
+ 		return err
+ 	}
+ 
+-	var bindings []*cloudresourcemanager.Binding
+-	if v, ok := d.GetOk("restore_policy"); ok {
+-		var restored cloudresourcemanager.Policy
+-		// if there's a restore policy, subtract it from the policy_data
+-		err := json.Unmarshal([]byte(v.(string)), &restored)
+-		if err != nil {
+-			return fmt.Errorf("Error unmarshaling restorable IAM policy: %v", err)
+-		}
+-		subtracted := subtractIamPolicy(p, &restored)
+-		bindings = subtracted.Bindings
+-	} else {
+-		bindings = p.Bindings
+-	}
+-	// we only marshal the bindings, because only the bindings get set in the config
+-	pBytes, err := json.Marshal(&cloudresourcemanager.Policy{Bindings: bindings})
+-	if err != nil {
+-		return fmt.Errorf("Error marshaling IAM policy: %v", err)
+-	}
+ 	log.Printf("[DEBUG]: Setting etag=%s", p.Etag)
+ 	d.Set("etag", p.Etag)
+-	d.Set("policy_data", string(pBytes))
+ 	return nil
+ }
+ 
+@@ -218,15 +199,14 @@ func resourceGoogleProjectIamPolicyDelete(d *schema.ResourceData, meta interface
+ 		ep.Bindings = make([]*cloudresourcemanager.Binding, 0)
+ 
+ 	} else {
+-		// A non-authoritative policy should set the policy to the value of "restore_policy" in state
+-		// Get the previous policy from state
+-		rp, err := getRestoreIamPolicy(d)
++		// A non-authoritative policy should set the policy to the value of existing policy on GCP minus "policy_data" in state
++		pp, err := getResourceIamPolicy(d)
+ 		if err != nil {
+ 			return fmt.Errorf("Error retrieving previous version of changed project IAM policy: %v", err)
+ 		}
+ 
+ 		// TODO not unit tested but this fixes the IAM policy issue
+-		ep = subtractIamPolicy(ep, rp)
++		ep = subtractIamPolicy(ep, pp)
+ 	}
+ 
+ 	if err = setProjectIamPolicy(ep, config, pid); err != nil {
+-- 
+2.11.0
+
